@@ -59,6 +59,16 @@ type Config struct {
 	SslBpfFile      string   `json:"sslbpffile"`      // Path to the eBPF object file for the detected OpenSSL version
 	IsAndroid       bool     `json:"is_android"`      // Whether the target system is Android (for Android-specific handling)
 	AndroidVer      string   `json:"androidver"`      // Android version (for Android-specific handling)
+
+	// Manual uprobe addresses (0 = use symbol resolution; non-zero = attach at this address directly)
+	// Useful for stripped binaries (e.g. Android BoringSSL) where symbol names are unavailable.
+	SSLWriteAddr       uint64 `json:"ssl_write_addr"`        // address of SSL_write
+	SSLReadAddr        uint64 `json:"ssl_read_addr"`         // address of SSL_read
+	SSLReadInnerOffset uint64 `json:"ssl_read_inner_offset"` // offset of inner memcpy BL from ssl_read_addr (0 = use default 0x6DC)
+	SSLSetFdAddr       uint64 `json:"ssl_set_fd_addr"`       // address of SSL_set_fd
+	SSLSetRfdAddr      uint64 `json:"ssl_set_rfd_addr"`      // address of SSL_set_rfd
+	SSLSetWfdAddr      uint64 `json:"ssl_set_wfd_addr"`      // address of SSL_set_wfd
+	SSLMasterKeyAddr   uint64 `json:"ssl_master_key_addr"`   // address of master-key hook (SSL_in_init / SSL_get_wbio etc.)
 }
 
 // NewConfig creates a new OpenSSL probe configuration.

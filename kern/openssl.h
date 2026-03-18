@@ -133,6 +133,16 @@ struct {
     __uint(max_entries, 10240);
 } tcp_fd_infos SEC(".maps");
 
+// Set by probe_SSL_read_inner when the inner-function uprobe already captured
+// SSL_read plaintext. probe_ret_SSL_read checks this to skip emitting a
+// duplicate (zeroed) event.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u64);
+    __type(value, u8);
+    __uint(max_entries, 1024);
+} ssl_read_inner_done SEC(".maps");
+
 
 /***********************************************************
  * General helper functions
@@ -178,12 +188,61 @@ static int process_SSL_data(struct pt_regs* ctx, u64 id,
     event->fd = fd;
     event->bio_type = bio_type;
     event->version = version;
-    // This is a max function, but it is written in such a way to keep older BPF
-    // verifiers happy.
-    event->data_len =
-        (len < MAX_DATA_SIZE_OPENSSL ? (len & (MAX_DATA_SIZE_OPENSSL - 1))
-                                     : MAX_DATA_SIZE_OPENSSL);
-    bpf_probe_read_user(event->data, event->data_len, buf);
+    // Use a local bounded variable so both bpf_probe_read_user calls satisfy the
+    // BPF verifier (re-reading from the map makes the value unbounded).
+    u32 data_len = (u32)(len < MAX_DATA_SIZE_OPENSSL
+                             ? (len & (MAX_DATA_SIZE_OPENSSL - 1))
+                             : MAX_DATA_SIZE_OPENSSL);
+    event->data_len = data_len;
+    int read_ret = bpf_probe_read_user(event->data, data_len, buf);
+    if (read_ret != 0) {
+        // Strip top byte (TBI/MTE tag) and retry with canonical address.
+        const char* canonical_buf = (const char*)((u64)buf & 0x00FFFFFFFFFFFFFFULL);
+        read_ret = bpf_probe_read_user(event->data, data_len, canonical_buf);
+    }
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event,
+                          sizeof(struct ssl_data_event_t));
+    return 0;
+}
+
+// Variant that uses an explicit length instead of the return value.
+// Used for SSL_write entry hooks where the plaintext buffer may be zeroed
+// by the TLS implementation before the return probe fires.
+static int process_SSL_data_with_len(struct pt_regs* ctx, u64 id,
+                                     enum ssl_data_event_type type,
+                                     const char* buf, int len,
+                                     u32 fd, s32 version, u32 bio_type) {
+    if (len <= 0) {
+        return 0;
+    }
+
+    struct ssl_data_event_t* event = create_ssl_data_event(id);
+    if (event == NULL) {
+        return 0;
+    }
+
+    event->type = type;
+    event->fd = fd;
+    event->bio_type = bio_type;
+    event->version = version;
+    // Keep data_len as a local bounded variable for both bpf_probe_read_user
+    // calls; re-reading event->data_len from the map makes it unbounded to the
+    // BPF verifier.
+    u32 data_len = (u32)(len < MAX_DATA_SIZE_OPENSSL
+                             ? (len & (MAX_DATA_SIZE_OPENSSL - 1))
+                             : MAX_DATA_SIZE_OPENSSL);
+    event->data_len = data_len;
+    // Try plain read first; if the pointer has top-byte tags (Android TBI/MTE),
+    // also try stripping bits 56-63 to get the canonical address.
+    int read_ret = bpf_probe_read_user(event->data, data_len, buf);
+    if (read_ret != 0) {
+        // Strip top byte (TBI/MTE tag) and retry
+        const char* canonical_buf = (const char*)((u64)buf & 0x00FFFFFFFFFFFFFFULL);
+        read_ret = bpf_probe_read_user(event->data, data_len, canonical_buf);
+    }
+    bpf_printk("SSL_write_entry buf=0x%llx len=%d read_ret=%d\n",
+               (u64)buf, len, read_ret);
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
     bpf_perf_event_output(ctx, &tls_events, BPF_F_CURRENT_CPU, event,
                           sizeof(struct ssl_data_event_t));
@@ -328,9 +387,36 @@ static __inline int probe_ret_SSL(struct pt_regs* ctx, void *map, enum ssl_data_
 
 // Function signature being probed:
 // int SSL_write(SSL *ssl, const void *buf, int num);
+// Capture plaintext at entry because some TLS implementations (e.g. Flutter's
+// BoringSSL) zero the caller's buffer after encrypting, before returning.
 SEC("uprobe/SSL_write")
 int probe_entry_SSL_write(struct pt_regs* ctx) {
-    return probe_entry_SSL(ctx, &active_ssl_write_args_map, SSL_ST_WBIO);
+    if (!passes_filter(ctx)) {
+        return 0;
+    }
+
+    void* ssl = (void*)PT_REGS_PARM1(ctx);
+    const char* buf = (const char*)PT_REGS_PARM2(ctx);
+    int num = (int)PT_REGS_PARM3(ctx);
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+
+    u64 ssl_version = 0;
+    int ret;
+#ifndef SSL_SESSION_ST_SSL_VERSION
+    u64 *ssl_ver_ptr = (u64 *)((uintptr_t)ssl + SSL_ST_VERSION);
+    ret = bpf_probe_read_user(&ssl_version, sizeof(ssl_version), (void *)ssl_ver_ptr);
+    if (ret) {
+        debug_bpf_printk("(OPENSSL) probe_entry_SSL_write: bpf_probe_read ssl_ver_ptr failed, ret: %d\n", ret);
+    }
+#endif
+
+    u32 fd = 0;
+    u32 bio_type = 0;
+    process_SSL_bio(ssl, SSL_ST_WBIO, &fd, &bio_type);
+
+    process_SSL_data_with_len(ctx, current_pid_tgid, kSSLWrite, buf, num,
+                              fd, (s32)ssl_version, bio_type);
+    return 0;
 }
 
 SEC("uretprobe/SSL_write")
@@ -338,15 +424,125 @@ int probe_ret_SSL_write(struct pt_regs* ctx) {
     return probe_ret_SSL(ctx, &active_ssl_write_args_map, kSSLWrite);
 }
 
-// Function signature being probed:
-// int SSL_read(SSL *s, void *buf, int num)
+// Inner uprobe fired at ssl_read_addr + <offset> (the BL to the memcpy stub
+// inside SSL_read for Flutter BoringSSL). Use --ssl_read_inner_offset to set.
+SEC("uprobe/SSL_read_inner")
+int probe_SSL_read_inner(struct pt_regs* ctx) {
+    if (!passes_filter(ctx)) {
+        return 0;
+    }
+
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+
+    // Retrieve fd/bio_type/version saved by probe_entry_SSL_read.
+    struct active_ssl_buf* args =
+        bpf_map_lookup_elem(&active_ssl_read_args_map, &current_pid_tgid);
+    if (args == NULL) {
+        return 0;
+    }
+    u32 fd = args->fd;
+    u32 bio_type = args->bio_type;
+    s32 version = args->version;
+
+    // Attach this probe via --ssl_read_inner_offset for new libflutter.so builds.
+    u64 raw_size = ctx->regs[22];
+    if (raw_size == 0 || raw_size > MAX_DATA_SIZE_OPENSSL) {
+        return 0;
+    }
+    int data_size = (int)(u32)raw_size;
+
+    // x1 = source pointer (decrypted plaintext in BoringSSL's C++ heap)
+    const char* buf = (const char*)PT_REGS_PARM2(ctx);
+
+    process_SSL_data_with_len(ctx, current_pid_tgid, kSSLRead, buf, data_size,
+                              fd, version, bio_type);
+
+    // Signal the uretprobe to skip duplicate capture.
+    u8 done = 1;
+    bpf_map_update_elem(&ssl_read_inner_done, &current_pid_tgid, &done, BPF_ANY);
+    return 0;
+}
+
+// Inner uprobe for other libflutter.so builds.
+SEC("uprobe/SSL_read_inner_x24")
+int probe_SSL_read_inner_x24(struct pt_regs* ctx) {
+    if (!passes_filter(ctx)) {
+        return 0;
+    }
+
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+
+    struct active_ssl_buf* args =
+        bpf_map_lookup_elem(&active_ssl_read_args_map, &current_pid_tgid);
+    if (args == NULL) {
+        return 0;
+    }
+    u32 fd = args->fd;
+    u32 bio_type = args->bio_type;
+    s32 version = args->version;
+
+    u64 raw_size = ctx->regs[24];
+    if (raw_size == 0 || raw_size > MAX_DATA_SIZE_OPENSSL) {
+        return 0;
+    }
+    int data_size = (int)(u32)raw_size;
+
+    const char* buf = (const char*)PT_REGS_PARM2(ctx);
+
+    process_SSL_data_with_len(ctx, current_pid_tgid, kSSLRead, buf, data_size,
+                              fd, version, bio_type);
+
+    u8 done = 1;
+    bpf_map_update_elem(&ssl_read_inner_done, &current_pid_tgid, &done, BPF_ANY);
+    return 0;
+}
+
 SEC("uprobe/SSL_read")
 int probe_entry_SSL_read(struct pt_regs* ctx) {
-    return probe_entry_SSL(ctx, &active_ssl_read_args_map, SSL_ST_RBIO);
+    if (!passes_filter(ctx)) {
+        return 0;
+    }
+
+    void* ssl = (void*)PT_REGS_PARM1(ctx);
+    // x20 is the callee-saved register inherited from sub_881D40 (SSLFilter wrapper).
+    const char* buf = (const char*)ctx->regs[20];
+
+    u64 ssl_version = 0;
+    int ret;
+#ifndef SSL_SESSION_ST_SSL_VERSION
+    u64 *ssl_ver_ptr = (u64 *)((uintptr_t)ssl + SSL_ST_VERSION);
+    ret = bpf_probe_read_user(&ssl_version, sizeof(ssl_version), (void *)ssl_ver_ptr);
+    if (ret) {
+        debug_bpf_printk("(OPENSSL) probe_entry_SSL_read: bpf_probe_read ssl_ver_ptr failed, ret: %d\n", ret);
+    }
+#endif
+
+    u32 fd = 0;
+    u32 bio_type = 0;
+    process_SSL_bio(ssl, SSL_ST_RBIO, &fd, &bio_type);
+
+    struct active_ssl_buf active_ssl_buf_t;
+    __builtin_memset(&active_ssl_buf_t, 0, sizeof(active_ssl_buf_t));
+    active_ssl_buf_t.fd = fd;
+    active_ssl_buf_t.version = ssl_version;
+    active_ssl_buf_t.buf = buf;
+    active_ssl_buf_t.bio_type = bio_type;
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&active_ssl_read_args_map, &current_pid_tgid, &active_ssl_buf_t, BPF_ANY);
+    return 0;
 }
 
 SEC("uretprobe/SSL_read")
 int probe_ret_SSL_read(struct pt_regs* ctx) {
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+    // If the inner uprobe already captured plaintext, skip to avoid a
+    // duplicate zeroed event (bpf_probe_read_user fails on Dart heap x20).
+    u8* inner_done = bpf_map_lookup_elem(&ssl_read_inner_done, &current_pid_tgid);
+    if (inner_done) {
+        bpf_map_delete_elem(&ssl_read_inner_done, &current_pid_tgid);
+        bpf_map_delete_elem(&active_ssl_read_args_map, &current_pid_tgid);
+        return 0;
+    }
     return probe_ret_SSL(ctx, &active_ssl_read_args_map, kSSLRead);
 }
 

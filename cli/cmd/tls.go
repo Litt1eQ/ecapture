@@ -54,6 +54,13 @@ func init() {
 	opensslCmd.PersistentFlags().StringVarP(&opensslConfig.PcapFile, "pcapfile", "w", "save.pcapng", "write the raw packets to file as pcapng format.")
 	opensslCmd.PersistentFlags().StringVarP(&opensslConfig.Ifname, "ifname", "i", "", "(TC Classifier) Interface name on which the probe will be attached.")
 	opensslCmd.PersistentFlags().StringVar(&opensslConfig.SslVersion, "ssl_version", "", "openssl/boringssl version， e.g: --ssl_version=\"openssl 1.1.1g\" or  --ssl_version=\"boringssl 1.1.1\".")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLWriteAddr, "ssl_write_addr", 0, "manual uprobe address of SSL_write (hex, e.g. 0x1234). For stripped binaries (e.g. Android BoringSSL).")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLReadAddr, "ssl_read_addr", 0, "manual uprobe address of SSL_read (hex, e.g. 0x1234).")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLReadInnerOffset, "ssl_read_inner_offset", 0, "offset of inner memcpy BL instruction from ssl_read_addr (0=auto: 0x6DC for newest Flutter).")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLSetFdAddr, "ssl_set_fd_addr", 0, "manual uprobe address of SSL_set_fd.")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLSetRfdAddr, "ssl_set_rfd_addr", 0, "manual uprobe address of SSL_set_rfd.")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLSetWfdAddr, "ssl_set_wfd_addr", 0, "manual uprobe address of SSL_set_wfd.")
+	opensslCmd.PersistentFlags().Uint64Var(&opensslConfig.SSLMasterKeyAddr, "ssl_master_key_addr", 0, "manual uprobe address of master-key hook (SSL_in_init for BoringSSL / SSL_get_wbio for OpenSSL).")
 	rootCmd.AddCommand(opensslCmd)
 }
 

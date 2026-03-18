@@ -250,24 +250,28 @@ func (p *Probe) setupManagerText() error {
 			EbpfFuncName:     "probe_entry_SSL_write",
 			AttachToFuncName: "SSL_write",
 			BinaryPath:       opensslPath,
+			UAddress:         p.config.SSLWriteAddr,
 		},
 		{
 			Section:          "uretprobe/SSL_write",
 			EbpfFuncName:     "probe_ret_SSL_write",
 			AttachToFuncName: "SSL_write",
 			BinaryPath:       opensslPath,
+			UAddress:         p.config.SSLWriteAddr,
 		},
 		{
 			Section:          "uprobe/SSL_read",
 			EbpfFuncName:     "probe_entry_SSL_read",
 			AttachToFuncName: "SSL_read",
 			BinaryPath:       opensslPath,
+			UAddress:         p.config.SSLReadAddr,
 		},
 		{
 			Section:          "uretprobe/SSL_read",
 			EbpfFuncName:     "probe_ret_SSL_read",
 			AttachToFuncName: "SSL_read",
 			BinaryPath:       opensslPath,
+			UAddress:         p.config.SSLReadAddr,
 		},
 
 		// --------------------------------------------------
@@ -326,27 +330,67 @@ func (p *Probe) setupManagerText() error {
 		},*/
 
 		// ------------------- SSL_set_fd hook-------------------------------------
-		{
+	}
+
+	// For Flutter BoringSSL: hook the inner BL to the memcpy stub inside
+	// SSL_read where x1=plaintext source (C++ heap). Reading from x1 bypasses
+	// the Dart-heap bpf_probe_read_user failure on the memcpy destination.
+	if p.config.SSLReadAddr != 0 {
+		if p.config.SSLReadInnerOffset != 0 {
+			// Explicit offset → older build, size in x22.
+			probes = append(probes, &manager.Probe{
+				Section:          "uprobe/SSL_read_inner",
+				EbpfFuncName:     "probe_SSL_read_inner",
+				AttachToFuncName: "SSL_read",
+				BinaryPath:       opensslPath,
+				UID:              "uprobe_ssl_read_inner",
+				UAddress:         p.config.SSLReadAddr + p.config.SSLReadInnerOffset,
+			})
+		} else {
+			// Default offset 0x6DC → newest build, size in x24.
+			probes = append(probes, &manager.Probe{
+				Section:          "uprobe/SSL_read_inner_x24",
+				EbpfFuncName:     "probe_SSL_read_inner_x24",
+				AttachToFuncName: "SSL_read",
+				BinaryPath:       opensslPath,
+				UID:              "uprobe_ssl_read_inner",
+				UAddress:         p.config.SSLReadAddr + 0x6DC,
+			})
+		}
+	}
+
+	// Only add SSL_set_fd probes when an explicit address is given OR the
+	// binary has exported symbols. For stripped BoringSSL (e.g. libflutter.so)
+	// without addresses these probes fail symbol lookup, so skip them.
+	if p.config.SSLSetFdAddr != 0 {
+		probes = append(probes, &manager.Probe{
 			Section:          "uprobe/SSL_set_fd",
 			EbpfFuncName:     "probe_SSL_set_fd",
 			AttachToFuncName: "SSL_set_fd",
 			BinaryPath:       opensslPath,
 			UID:              "uprobe_ssl_set_fd",
-		},
-		{
+			UAddress:         p.config.SSLSetFdAddr,
+		})
+	}
+	if p.config.SSLSetRfdAddr != 0 {
+		probes = append(probes, &manager.Probe{
 			Section:          "uprobe/SSL_set_rfd",
 			EbpfFuncName:     "probe_SSL_set_fd",
 			AttachToFuncName: "SSL_set_rfd",
 			BinaryPath:       opensslPath,
 			UID:              "uprobe_ssl_set_rfd",
-		},
-		{
+			UAddress:         p.config.SSLSetRfdAddr,
+		})
+	}
+	if p.config.SSLSetWfdAddr != 0 {
+		probes = append(probes, &manager.Probe{
 			Section:          "uprobe/SSL_set_wfd",
 			EbpfFuncName:     "probe_SSL_set_fd",
 			AttachToFuncName: "SSL_set_wfd",
 			BinaryPath:       opensslPath,
 			UID:              "uprobe_ssl_set_wfd",
-		},
+			UAddress:         p.config.SSLSetWfdAddr,
+		})
 	}
 
 	p.bpfManager = &manager.Manager{
@@ -402,21 +446,32 @@ func (p *Probe) setupManagerPcapNG() error {
 	p.Logger().Info().Str("ifname", p.config.Ifname).Int("decoder", len(p.mapNameToDecoder)).Msg("Configuring TC probes for network capture in pcapng mode")
 
 	// Add master secret extraction
-	p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).Msg("Configuring master secret extraction probes for pcapNG mode")
-	for _, masterFunc := range p.config.MasterHookFuncs {
+	p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).Uint64("ssl_master_key_addr", p.config.SSLMasterKeyAddr).Msg("Configuring master secret extraction probes for pcapNG mode")
+	if p.config.SSLMasterKeyAddr != 0 {
 		probes = append(probes, &manager.Probe{
 			Section:          "uprobe/SSL_write_key",
 			EbpfFuncName:     "probe_ssl_master_key",
-			AttachToFuncName: masterFunc,
+			AttachToFuncName: p.config.MasterHookFuncs[0],
 			BinaryPath:       opensslPath,
-			UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
+			UID:              "uprobe_smk_manual",
+			UAddress:         p.config.SSLMasterKeyAddr,
 		})
+	} else {
+		for _, masterFunc := range p.config.MasterHookFuncs {
+			probes = append(probes, &manager.Probe{
+				Section:          "uprobe/SSL_write_key",
+				EbpfFuncName:     "probe_ssl_master_key",
+				AttachToFuncName: masterFunc,
+				BinaryPath:       opensslPath,
+				UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
+			})
+		}
 	}
 
 	// Create writer factory for creating output writers
 	writerFactory := writers.NewWriterFactory()
 	// Create file writer for keylog
-	keylogWriter, err := writerFactory.CreateWriter(p.config.GetKeylogFile(), &writers.RotateConfig{false, 0, 300})
+	keylogWriter, err := writerFactory.CreateWriter(p.config.GetKeylogFile(), &writers.RotateConfig{EnableRotate: false, MaxSizeMB: 0, MaxInterval: 300})
 	if err != nil {
 		p.Logger().Warn().Err(err).Str("keylog file", p.config.GetKeylogFile()).Msg("Failed to create keylog handler, continuing without keylog")
 	} else {
@@ -496,23 +551,35 @@ func (p *Probe) setupManagerKeyLog() error {
 	p.mapNameToDecoder["mastersecret_events"] = &masterSecretEventDecoder{}
 
 	// Add master secret extraction probes based on OpenSSL version
-	p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).Msg("Configuring master secret extraction probes for KeyLog mode")
+	p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).Uint64("ssl_master_key_addr", p.config.SSLMasterKeyAddr).Msg("Configuring master secret extraction probes for KeyLog mode")
 	probes = make([]*manager.Probe, 0)
-	for _, masterFunc := range p.config.MasterHookFuncs {
+	if p.config.SSLMasterKeyAddr != 0 {
+		// Manual address mode: a single probe at the specified address
 		probes = append(probes, &manager.Probe{
 			Section:          "uprobe/SSL_write_key",
 			EbpfFuncName:     "probe_ssl_master_key",
-			AttachToFuncName: masterFunc,
+			AttachToFuncName: p.config.MasterHookFuncs[0],
 			BinaryPath:       opensslPath,
-			UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
+			UID:              "uprobe_smk_manual",
+			UAddress:         p.config.SSLMasterKeyAddr,
 		})
+	} else {
+		for _, masterFunc := range p.config.MasterHookFuncs {
+			probes = append(probes, &manager.Probe{
+				Section:          "uprobe/SSL_write_key",
+				EbpfFuncName:     "probe_ssl_master_key",
+				AttachToFuncName: masterFunc,
+				BinaryPath:       opensslPath,
+				UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
+			})
+		}
 	}
 
 	// Create writer factory for creating output writers
 	writerFactory := writers.NewWriterFactory()
 
 	// Create file writer for keylog
-	keylogWriter, err := writerFactory.CreateWriter(p.config.GetKeylogFile(), &writers.RotateConfig{false, 0, 300})
+	keylogWriter, err := writerFactory.CreateWriter(p.config.GetKeylogFile(), &writers.RotateConfig{EnableRotate: false, MaxSizeMB: 0, MaxInterval: 300})
 	if err != nil {
 		return fmt.Errorf("failed to create keylog writer: %w", err)
 	}

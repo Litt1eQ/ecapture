@@ -15,12 +15,14 @@
 package openssl
 
 import (
+	"archive/zip"
 	"debug/elf"
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
 	"net"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -69,6 +71,13 @@ type Config struct {
 	SSLSetRfdAddr      uint64 `json:"ssl_set_rfd_addr"`      // address of SSL_set_rfd
 	SSLSetWfdAddr      uint64 `json:"ssl_set_wfd_addr"`      // address of SSL_set_wfd
 	SSLMasterKeyAddr   uint64 `json:"ssl_master_key_addr"`   // address of master-key hook (SSL_in_init / SSL_get_wbio etc.)
+
+	// APK-backed libraries need their zip entry data offset added once to each
+	// absolute uprobe address. Keep the resolved metadata private so repeated
+	// validation does not double-apply it.
+	apkLibEntryName    string `json:"-"`
+	apkEntryDataOffset uint64 `json:"-"`
+	apkOffsetsApplied  bool   `json:"-"`
 }
 
 // NewConfig creates a new OpenSSL probe configuration.
@@ -97,6 +106,10 @@ func (c *Config) Validate() error {
 
 	if err := c.getSslBpfFile(c.OpensslPath, c.SslVersion); err != nil {
 		return errors.NewConfigurationError("openssl bpf file detection failed", err)
+	}
+
+	if err := c.adjustManualAddressesForContainer(); err != nil {
+		return errors.NewConfigurationError("openssl container address resolution failed", err)
 	}
 
 	if err := c.validateConfig(); err != nil {
@@ -265,6 +278,138 @@ func (c *Config) GetPcapFile() string {
 // GetKeylogFile returns the keylog file path.
 func (c *Config) GetKeylogFile() string {
 	return c.KeylogFile
+}
+
+func (c *Config) adjustManualAddressesForContainer() error {
+	if c.apkOffsetsApplied || !looksLikeAPKPath(c.OpensslPath) || !c.hasManualUprobeAddresses() {
+		return nil
+	}
+
+	entryName, entryOffset, err := resolveAPKNativeLibOffset(c.OpensslPath)
+	if err != nil {
+		return err
+	}
+
+	c.SSLWriteAddr = addContainerOffset(c.SSLWriteAddr, entryOffset)
+	c.SSLReadAddr = addContainerOffset(c.SSLReadAddr, entryOffset)
+	c.SSLSetFdAddr = addContainerOffset(c.SSLSetFdAddr, entryOffset)
+	c.SSLSetRfdAddr = addContainerOffset(c.SSLSetRfdAddr, entryOffset)
+	c.SSLSetWfdAddr = addContainerOffset(c.SSLSetWfdAddr, entryOffset)
+	c.SSLMasterKeyAddr = addContainerOffset(c.SSLMasterKeyAddr, entryOffset)
+
+	c.apkLibEntryName = entryName
+	c.apkEntryDataOffset = entryOffset
+	c.apkOffsetsApplied = true
+	return nil
+}
+
+func (c *Config) hasManualUprobeAddresses() bool {
+	return c.SSLWriteAddr != 0 ||
+		c.SSLReadAddr != 0 ||
+		c.SSLSetFdAddr != 0 ||
+		c.SSLSetRfdAddr != 0 ||
+		c.SSLSetWfdAddr != 0 ||
+		c.SSLMasterKeyAddr != 0
+}
+
+func looksLikeAPKPath(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".apk")
+}
+
+func addContainerOffset(addr, offset uint64) uint64 {
+	if addr == 0 {
+		return 0
+	}
+	return addr + offset
+}
+
+func resolveAPKNativeLibOffset(apkPath string) (string, uint64, error) {
+	reader, err := zip.OpenReader(apkPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("open apk %s: %w", apkPath, err)
+	}
+	defer reader.Close()
+
+	file, err := pickAPKNativeLibEntry(reader.File)
+	if err != nil {
+		return "", 0, err
+	}
+	if file.Method != zip.Store {
+		return "", 0, fmt.Errorf("apk entry %s is compressed; native libs must be stored", file.Name)
+	}
+
+	dataOffset, err := file.DataOffset()
+	if err != nil {
+		return "", 0, fmt.Errorf("resolve apk entry offset for %s: %w", file.Name, err)
+	}
+	if dataOffset < 0 {
+		return "", 0, fmt.Errorf("invalid apk entry offset for %s: %d", file.Name, dataOffset)
+	}
+
+	return file.Name, uint64(dataOffset), nil
+}
+
+func pickAPKNativeLibEntry(files []*zip.File) (*zip.File, error) {
+	byName := make(map[string]*zip.File, len(files))
+	matches := make([]*zip.File, 0, len(files))
+	for _, file := range files {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		byName[file.Name] = file
+		if isKnownAPKNativeLibEntry(file.Name) {
+			matches = append(matches, file)
+		}
+	}
+
+	for _, preferred := range preferredAPKNativeLibEntries {
+		if file, ok := byName[preferred]; ok {
+			return file, nil
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("cannot find a supported native library entry in apk")
+	case 1:
+		return matches[0], nil
+	default:
+		names := make([]string, 0, len(matches))
+		for _, match := range matches {
+			names = append(names, match.Name)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("multiple native library entries found in apk: %s", strings.Join(names, ", "))
+	}
+}
+
+var preferredAPKNativeLibEntries = []string{
+	"lib/arm64-v8a/libflutter.so",
+	"lib/armeabi-v7a/libflutter.so",
+	"lib/x86_64/libflutter.so",
+	"lib/x86/libflutter.so",
+	"lib/arm64-v8a/libssl.so",
+	"lib/armeabi-v7a/libssl.so",
+	"lib/x86_64/libssl.so",
+	"lib/x86/libssl.so",
+	"lib/arm64-v8a/libboringssl.so",
+	"lib/armeabi-v7a/libboringssl.so",
+	"lib/x86_64/libboringssl.so",
+	"lib/x86/libboringssl.so",
+}
+
+func isKnownAPKNativeLibEntry(name string) bool {
+	dir, file := pathpkg.Split(name)
+	if !strings.HasPrefix(dir, "lib/") {
+		return false
+	}
+
+	switch file {
+	case "libflutter.so", "libssl.so", "libboringssl.so":
+		return true
+	default:
+		return false
+	}
 }
 
 // getSslBpfFile 根据sslVersion参数，获取对应的bpf文件

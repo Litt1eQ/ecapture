@@ -15,7 +15,9 @@
 package openssl
 
 import (
+	"archive/zip"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gojue/ecapture/internal/probe/base/handlers"
@@ -225,4 +227,131 @@ func TestConfig_ValidateCaptureMode_Pcap(t *testing.T) {
 	if err == nil {
 		t.Error("validateCaptureMode() should fail for pcap mode without pcap file")
 	}
+}
+
+func TestConfig_AdjustManualAddressesForContainer(t *testing.T) {
+	apkPath := createTestAPK(t, map[string]string{
+		"lib/armeabi-v7a/libflutter.so": "arm32",
+		"lib/arm64-v8a/libflutter.so":   "arm64",
+	})
+
+	cfg := NewConfig()
+	cfg.OpensslPath = apkPath
+	cfg.SSLWriteAddr = 0x100
+	cfg.SSLReadAddr = 0x200
+	cfg.SSLSetFdAddr = 0x300
+	cfg.SSLMasterKeyAddr = 0x400
+	cfg.SSLReadInnerOffset = 0x5F8
+
+	expectedEntry, expectedOffset := mustResolveAPKEntry(t, apkPath, "lib/arm64-v8a/libflutter.so")
+
+	if err := cfg.adjustManualAddressesForContainer(); err != nil {
+		t.Fatalf("adjustManualAddressesForContainer() error = %v", err)
+	}
+
+	if cfg.apkLibEntryName != expectedEntry {
+		t.Fatalf("apkLibEntryName = %q, want %q", cfg.apkLibEntryName, expectedEntry)
+	}
+	if cfg.apkEntryDataOffset != expectedOffset {
+		t.Fatalf("apkEntryDataOffset = %#x, want %#x", cfg.apkEntryDataOffset, expectedOffset)
+	}
+	if cfg.SSLWriteAddr != expectedOffset+0x100 {
+		t.Fatalf("SSLWriteAddr = %#x, want %#x", cfg.SSLWriteAddr, expectedOffset+0x100)
+	}
+	if cfg.SSLReadAddr != expectedOffset+0x200 {
+		t.Fatalf("SSLReadAddr = %#x, want %#x", cfg.SSLReadAddr, expectedOffset+0x200)
+	}
+	if cfg.SSLSetFdAddr != expectedOffset+0x300 {
+		t.Fatalf("SSLSetFdAddr = %#x, want %#x", cfg.SSLSetFdAddr, expectedOffset+0x300)
+	}
+	if cfg.SSLMasterKeyAddr != expectedOffset+0x400 {
+		t.Fatalf("SSLMasterKeyAddr = %#x, want %#x", cfg.SSLMasterKeyAddr, expectedOffset+0x400)
+	}
+	if cfg.SSLReadInnerOffset != 0x5F8 {
+		t.Fatalf("SSLReadInnerOffset = %#x, want %#x", cfg.SSLReadInnerOffset, uint64(0x5F8))
+	}
+
+	if err := cfg.adjustManualAddressesForContainer(); err != nil {
+		t.Fatalf("second adjustManualAddressesForContainer() error = %v", err)
+	}
+	if cfg.SSLWriteAddr != expectedOffset+0x100 {
+		t.Fatalf("SSLWriteAddr reapplied = %#x, want %#x", cfg.SSLWriteAddr, expectedOffset+0x100)
+	}
+}
+
+func TestResolveAPKNativeLibOffsetRejectsCompressedEntries(t *testing.T) {
+	apkPath := createCompressedTestAPK(t, map[string]string{
+		"lib/arm64-v8a/libflutter.so": "compressed",
+	})
+
+	if _, _, err := resolveAPKNativeLibOffset(apkPath); err == nil {
+		t.Fatal("resolveAPKNativeLibOffset() error = nil, want non-nil")
+	}
+}
+
+func createTestAPK(t *testing.T, entries map[string]string) string {
+	t.Helper()
+	return createZipWithMethod(t, entries, zip.Store)
+}
+
+func createCompressedTestAPK(t *testing.T, entries map[string]string) string {
+	t.Helper()
+	return createZipWithMethod(t, entries, zip.Deflate)
+}
+
+func createZipWithMethod(t *testing.T, entries map[string]string, method uint16) string {
+	t.Helper()
+
+	apkPath := filepath.Join(t.TempDir(), "test.apk")
+	file, err := os.Create(apkPath)
+	if err != nil {
+		t.Fatalf("os.Create() error = %v", err)
+	}
+
+	writer := zip.NewWriter(file)
+	for name, content := range entries {
+		header := &zip.FileHeader{
+			Name:   name,
+			Method: method,
+		}
+		entryWriter, err := writer.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("CreateHeader(%q) error = %v", name, err)
+		}
+		if _, err := entryWriter.Write([]byte(content)); err != nil {
+			t.Fatalf("Write(%q) error = %v", name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close() error = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("file.Close() error = %v", err)
+	}
+
+	return apkPath
+}
+
+func mustResolveAPKEntry(t *testing.T, apkPath, entryName string) (string, uint64) {
+	t.Helper()
+
+	reader, err := zip.OpenReader(apkPath)
+	if err != nil {
+		t.Fatalf("zip.OpenReader() error = %v", err)
+	}
+	defer reader.Close()
+
+	for _, file := range reader.File {
+		if file.Name != entryName {
+			continue
+		}
+		offset, err := file.DataOffset()
+		if err != nil {
+			t.Fatalf("DataOffset(%q) error = %v", entryName, err)
+		}
+		return file.Name, uint64(offset)
+	}
+
+	t.Fatalf("entry %q not found in %s", entryName, apkPath)
+	return "", 0
 }

@@ -1,3 +1,6 @@
 [submodule "lib/libpcap"]
 	path = lib/libpcap
 	url = https://github.com/the-tcpdump-group/libpcap.git
+[submodule "third_party/ebpfmanager"]
+	path = third_party/ebpfmanager
+	url = https://github.com/Litt1eQ/ebpfmanager

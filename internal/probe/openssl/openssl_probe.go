@@ -86,13 +86,17 @@ func (p *Probe) Initialize(ctx context.Context, cfg domain.Configuration) error 
 			fmt.Sprintf("unsupported OpenSSL version: %s", p.config.SslVersion))
 	}
 
-	// Log initialization
-	p.Logger().Info().
+	logEvent := p.Logger().Info().
 		Str("openssl_path", opensslConfig.OpensslPath).
 		Str("ssl_version", opensslConfig.SslVersion).
 		Bool("is_boringssl", opensslConfig.IsBoringSSL).
-		Str("capture_mode", opensslConfig.CaptureMode).
-		Msg("OpenSSL probe initialized")
+		Str("capture_mode", opensslConfig.CaptureMode)
+	if opensslConfig.apkOffsetsApplied {
+		logEvent = logEvent.
+			Str("apk_lib_entry", opensslConfig.apkLibEntryName).
+			Uint64("apk_entry_data_offset", opensslConfig.apkEntryDataOffset)
+	}
+	logEvent.Msg("OpenSSL probe initialized")
 
 	return nil
 }

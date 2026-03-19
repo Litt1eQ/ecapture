@@ -61,3 +61,4 @@ require (
 )
 
 replace github.com/google/gopacket v1.1.19 => github.com/cfc4n/gopacket v1.1.20
+replace github.com/gojue/ebpfmanager => ./third_party/ebpfmanager
